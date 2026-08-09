@@ -16,6 +16,7 @@
 
 import logging
 import time
+from contextlib import suppress
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -28,6 +29,8 @@ from ..teleoperator import Teleoperator
 from .config_so_leader import SOLeaderTeleopConfig
 
 logger = logging.getLogger(__name__)
+
+TORQUE_COMM_RETRIES = 5
 
 
 class SOLeader(Teleoperator):
@@ -131,10 +134,31 @@ class SOLeader(Teleoperator):
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
     def enable_torque(self) -> None:
-        self.bus.enable_torque()
+        enabled_motors: list[str] = []
+        try:
+            for motor in self.bus.motors:
+                self.bus.enable_torque(motor, num_retry=TORQUE_COMM_RETRIES)
+                enabled_motors.append(motor)
+        except Exception:
+            logger.exception(
+                "Failed to enable leader torque; disabling %d previously enabled motors",
+                len(enabled_motors),
+            )
+            for motor in reversed(enabled_motors):
+                with suppress(Exception):
+                    self.bus.disable_torque(motor, num_retry=TORQUE_COMM_RETRIES)
+            raise
 
     def disable_torque(self) -> None:
-        self.bus.disable_torque()
+        errors: list[tuple[str, Exception]] = []
+        for motor in self.bus.motors:
+            try:
+                self.bus.disable_torque(motor, num_retry=TORQUE_COMM_RETRIES)
+            except Exception as exc:
+                errors.append((motor, exc))
+        if errors:
+            failed = ", ".join(motor for motor, _ in errors)
+            raise ConnectionError(f"Failed to disable leader torque for motors: {failed}") from errors[0][1]
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):

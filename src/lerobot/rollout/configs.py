@@ -100,7 +100,8 @@ class DAggerKeyboardConfig:
     """Keyboard key bindings for DAgger controls.
 
     Keys are specified as single characters (e.g. ``"c"``, ``"h"``) or
-    special key names (``"space"``).
+    special key names (``"space"``). ``correction`` is retained for config
+    compatibility but the DAgger phase cycle now uses ``pause_resume`` alone.
     """
 
     pause_resume: str = "space"
@@ -117,6 +118,7 @@ class DAggerPedalConfig:
 
     device_path: str = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
     pause_resume: str = "KEY_A"
+    # Retained for configuration compatibility; pause_resume advances all phases.
     correction: str = "KEY_B"
     upload: str = "KEY_C"
 
@@ -159,11 +161,9 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     Intervention frames are tagged with ``intervention=True``.
 
     Input is controlled via either a keyboard or foot pedal, selected by
-    ``input_device``.  Each device exposes three actions:
-
-    1. **pause_resume** — toggle policy execution on/off.
-    2. **correction** — toggle human correction recording.
-    3. **upload** — push dataset to hub on demand (corrections-only mode).
+    ``input_device``. ``pause_resume`` advances through autonomous execution,
+    aligned pause, correction recording, and back to autonomous execution.
+    ``upload`` pushes the dataset on demand in corrections-only mode.
 
     When ``record_autonomous=False`` (default) only human-correction windows
     are recorded — each correction becomes its own episode.  Set to ``True``
@@ -181,12 +181,26 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     # mode only).  Defaults to DEFAULT_VIDEO_FILE_SIZE_IN_MB when None.
     target_video_file_size_mb: int | None = None
     input_device: str = "keyboard"
+    # Treat the current leader and follower poses as equivalent when a correction
+    # begins, then apply only subsequent leader deltas. This preserves continuity,
+    # but unlike normal SO leader teleoperation it does not preserve equal absolute
+    # joint poses. Leave this disabled for exact lerobot-teleoperate-style mapping.
+    relative_clutch_handover: bool = False
+    # When enabled, actuate a feedback-capable leader so it matches the measured
+    # follower pose before correction. Disable this to keep the leader torque-free
+    # and align it manually before pressing the correction control.
+    smooth_leader_to_follower_handover: bool = True
+    # Maximum allowed per-joint leader/follower difference when using manual
+    # handover. A correction request is rejected until all joints are this close.
+    manual_handover_max_delta: float = 10.0
     keyboard: DAggerKeyboardConfig = field(default_factory=DAggerKeyboardConfig)
     pedal: DAggerPedalConfig = field(default_factory=DAggerPedalConfig)
 
     def __post_init__(self):
         if self.input_device not in ("keyboard", "pedal"):
             raise ValueError(f"DAgger input_device must be 'keyboard' or 'pedal', got '{self.input_device}'")
+        if self.manual_handover_max_delta <= 0:
+            raise ValueError("DAgger manual_handover_max_delta must be greater than zero")
 
 
 # ---------------------------------------------------------------------------

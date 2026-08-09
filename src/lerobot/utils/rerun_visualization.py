@@ -19,8 +19,10 @@ backend at runtime through the dispatch in :mod:`lerobot.utils.visualization_uti
 importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot[viz]'``).
 """
 
+import logging
 import numbers
 import os
+import threading
 
 import numpy as np
 
@@ -29,6 +31,10 @@ from lerobot.types import RobotAction, RobotObservation
 
 from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 from .import_utils import require_package
+
+logger = logging.getLogger(__name__)
+
+RERUN_SHUTDOWN_TIMEOUT_S = 2.0
 
 
 def _is_scalar(x):
@@ -65,12 +71,29 @@ def init_rerun(
 
 
 def shutdown_rerun() -> None:
-    """Shuts down the Rerun SDK gracefully."""
+    """Shut down Rerun without allowing a backpressured channel to hang exit."""
 
     require_package("rerun-sdk", extra="viz", import_name="rerun")
     import rerun as rr
 
-    rr.rerun_shutdown()
+    error: list[Exception] = []
+
+    def shutdown() -> None:
+        try:
+            rr.rerun_shutdown()
+        except Exception as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=shutdown, name="rerun-shutdown", daemon=True)
+    thread.start()
+    thread.join(timeout=RERUN_SHUTDOWN_TIMEOUT_S)
+    if thread.is_alive():
+        logger.warning(
+            "Rerun shutdown exceeded %.1fs; continuing process exit",
+            RERUN_SHUTDOWN_TIMEOUT_S,
+        )
+    elif error:
+        logger.warning("Rerun shutdown failed: %s", error[0])
 
 
 def _build_blueprint(observation_paths: set[str], action_paths: set[str], image_paths: set[str]):

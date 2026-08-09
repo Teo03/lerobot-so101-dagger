@@ -358,7 +358,15 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
     """
     suffix = f" ({controls_help})" if controls_help else ""
 
-    if pynput_can_capture() and keyboard is not None:
+    force_terminal = os.environ.get("LEROBOT_FORCE_TERMINAL_KEYBOARD", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if force_terminal:
+        logger.info("Forcing terminal keyboard input via LEROBOT_FORCE_TERMINAL_KEYBOARD%s.", suffix)
+
+    if not force_terminal and pynput_can_capture() and keyboard is not None:
 
         def on_press(key):
             with contextlib.suppress(Exception):

@@ -19,11 +19,10 @@ imitation learning.  Alternates between autonomous policy execution and
 human intervention via teleoperator.
 
 Input is controlled via either a keyboard or foot pedal, selected by
-the ``input_device`` config field.  Each device exposes three actions:
+the ``input_device`` config field. The phase-advance control cycles through:
 
-    1. **pause_resume** — Toggle policy execution (AUTONOMOUS <-> PAUSED).
-    2. **correction**   — Toggle correction recording (PAUSED <-> CORRECTING).
-    3. **upload**        — Push dataset to hub on demand (corrections-only mode).
+    1. **pause_resume** — Advance AUTONOMOUS → PAUSED → CORRECTING → AUTONOMOUS.
+    2. **upload**        — Push dataset to hub on demand (corrections-only mode).
     ESC (keyboard only) — Stop session.
 
 Recording modes:
@@ -36,7 +35,7 @@ Recording modes:
 Teleoperator handover:
     On AUTONOMOUS → PAUSED, actuated teleops (those with non-empty
     ``feedback_features``, e.g. SO-101, OpenArmMini) are smoothly driven to
-    the follower's last position via ``send_feedback`` so the operator takes
+    the follower's measured position via ``send_feedback`` so the operator takes
     over without a jerk.  Non-actuated teleops cannot be driven,
     so on PAUSED → CORRECTING the follower is instead slid to the teleop's
     current pose before the correction begins.
@@ -91,9 +90,8 @@ class DAggerPhase(enum.Enum):
 # Valid (current_phase, event) -> next_phase
 _DAGGER_TRANSITIONS: dict[tuple[DAggerPhase, str], DAggerPhase] = {
     (DAggerPhase.AUTONOMOUS, "pause_resume"): DAggerPhase.PAUSED,
-    (DAggerPhase.PAUSED, "pause_resume"): DAggerPhase.AUTONOMOUS,
-    (DAggerPhase.PAUSED, "correction"): DAggerPhase.CORRECTING,
-    (DAggerPhase.CORRECTING, "correction"): DAggerPhase.PAUSED,
+    (DAggerPhase.PAUSED, "pause_resume"): DAggerPhase.CORRECTING,
+    (DAggerPhase.CORRECTING, "pause_resume"): DAggerPhase.AUTONOMOUS,
 }
 
 
@@ -164,51 +162,40 @@ class DAggerEvents:
 
 
 def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
-    """Initialise a keyboard listener for DAgger's 3 controls.
+    """Initialise a keyboard listener for DAgger's single phase-advance control.
 
     Backend selection (pynput on X11 / trusted-macOS / Windows, a terminal reader on
     Wayland / headless TTY) is delegated to :func:`create_key_listener`. Returns the
     listener (exposing ``stop()``) or ``None`` when no keyboard backend is usable.
     """
-    # Map config key names to DAgger event names.
-    key_to_event = {
-        cfg.pause_resume: "pause_resume",
-        cfg.correction: "correction",
-    }
-
     def dispatch(name: str) -> None:
         """Apply a resolved key name to the DAgger events."""
         if name == "esc":
             logger.info("Stop recording...")
             events.stop_recording.set()
             return
-        if name in key_to_event:
-            events.request_transition(key_to_event[name])
+        if name == cfg.pause_resume:
+            events.request_transition("pause_resume")
         if name == cfg.upload:
             events.upload_requested.set()
 
     return create_key_listener(
         dispatch,
         controls_help=(
-            f"pause_resume='{cfg.pause_resume}', correction='{cfg.correction}', "
-            f"upload='{cfg.upload}', ESC=stop"
+            f"advance='{cfg.pause_resume}' (ACT→align→correct→ACT), "
+            f"upload='{cfg.upload}', ESC=finish"
         ),
     )
 
 
 def _init_dagger_pedal(events: DAggerEvents, cfg: DAggerPedalConfig):
-    """Initialise foot pedal listener with DAgger 3-pedal controls.
+    """Initialise a pedal listener with a single phase-advance pedal.
 
     Returns the pedal listener thread (or ``None`` if evdev is unavailable).
     """
-    code_to_event = {
-        cfg.pause_resume: "pause_resume",
-        cfg.correction: "correction",
-    }
-
     def on_press(code: str) -> None:
-        if code in code_to_event:
-            events.request_transition(code_to_event[code])
+        if code == cfg.pause_resume:
+            events.request_transition("pause_resume")
         if code == cfg.upload:
             events.upload_requested.set()
 
@@ -247,10 +234,35 @@ class DAggerStrategy(RolloutStrategy):
         self._pending_push: Future | None = None
         self._needs_push = Event()
         self._episode_lock = Lock()
+        self._clutch_leader_origin: dict[str, float] | None = None
+        self._clutch_follower_origin: dict[str, float] | None = None
+        self._pause_hold_action: dict[str, float] | None = None
+        self._leader_start_pose: dict[str, float] | None = None
+
+    def _apply_relative_clutch(self, teleop_action: dict[str, float]) -> dict[str, float]:
+        """Convert leader motion since clutch engagement into follower-space targets."""
+        if self._clutch_leader_origin is None or self._clutch_follower_origin is None:
+            raise RuntimeError("Relative clutch used before its origins were captured")
+        adjusted: dict[str, float] = {}
+        for key, value in teleop_action.items():
+            if key in self._clutch_leader_origin and key in self._clutch_follower_origin:
+                adjusted[key] = self._clutch_follower_origin[key] + value - self._clutch_leader_origin[key]
+            else:
+                adjusted[key] = value
+        return adjusted
 
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine and input device listener."""
         self._init_engine(ctx)
+        teleop = ctx.hardware.teleop
+        if (
+            teleop is not None
+            and teleop_supports_feedback(teleop)
+            and self.config.smooth_leader_to_follower_handover
+            and not self.config.relative_clutch_handover
+        ):
+            self._leader_start_pose = {key: float(value) for key, value in teleop.get_action().items()}
+            logger.info("Captured leader startup pose (%d joints)", len(self._leader_start_pose))
         self._push_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dagger-push")
         target_mb = self.config.target_video_file_size_mb or DEFAULT_VIDEO_FILE_SIZE_IN_MB
         self._episode_duration_s = estimate_max_episode_seconds(
@@ -306,6 +318,13 @@ class DAggerStrategy(RolloutStrategy):
                 ):
                     logger.info("Dataset uploaded to hub")
                     log_say("Dataset uploaded to hub", play_sounds)
+
+        teleop = ctx.hardware.teleop
+        if teleop is not None and teleop.is_connected and teleop_supports_feedback(teleop):
+            try:
+                teleop.disable_torque()
+            except Exception as exc:
+                logger.warning("Could not disable leader torque during teardown: %s", exc)
 
         self._teardown_hardware(
             ctx.hardware,
@@ -386,6 +405,8 @@ class DAggerStrategy(RolloutStrategy):
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
                         teleop_action = teleop.get_action()
+                        if self.config.relative_clutch_handover:
+                            teleop_action = self._apply_relative_clutch(teleop_action)
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
                         robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
                         robot.send_action(robot_action_to_send)
@@ -405,8 +426,9 @@ class DAggerStrategy(RolloutStrategy):
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
-                        if last_action:
-                            robot.send_action(last_action)
+                        hold_action = self._pause_hold_action or last_action
+                        if hold_action:
+                            robot.send_action(hold_action)
 
                     # --- AUTONOMOUS: policy control ---
                     else:
@@ -526,6 +548,10 @@ class DAggerStrategy(RolloutStrategy):
                     transition = events.consume_transition()
                     if transition is not None:
                         old_phase, new_phase = transition
+                        correction_to_autonomous = (
+                            old_phase == DAggerPhase.CORRECTING
+                            and new_phase == DAggerPhase.AUTONOMOUS
+                        )
                         self._apply_transition(
                             old_phase,
                             new_phase,
@@ -533,12 +559,13 @@ class DAggerStrategy(RolloutStrategy):
                             interpolator,
                             ctx,
                             last_action,
+                            defer_autonomous_resume=correction_to_autonomous,
                         )
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
 
                         # Correction ended -> save episode (blocking if not streaming)
-                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+                        if correction_to_autonomous:
                             with self._episode_lock:
                                 dataset.save_episode()
                             recorded += 1
@@ -549,6 +576,8 @@ class DAggerStrategy(RolloutStrategy):
                                 self.config.num_episodes,
                             )
                             log_say(f"Correction {recorded} saved", play_sounds)
+                            engine.resume()
+                            logger.info("Autonomous mode resumed after correction save")
 
                     # On-demand upload
                     if events.upload_requested.is_set():
@@ -566,6 +595,8 @@ class DAggerStrategy(RolloutStrategy):
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
                         teleop_action = teleop.get_action()
+                        if self.config.relative_clutch_handover:
+                            teleop_action = self._apply_relative_clutch(teleop_action)
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
                         robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
                         robot.send_action(robot_action_to_send)
@@ -587,8 +618,9 @@ class DAggerStrategy(RolloutStrategy):
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
-                        if last_action:
-                            robot.send_action(last_action)
+                        hold_action = self._pause_hold_action or last_action
+                        if hold_action:
+                            robot.send_action(hold_action)
 
                     # --- AUTONOMOUS: policy control (no recording) ---
                     else:
@@ -623,14 +655,16 @@ class DAggerStrategy(RolloutStrategy):
     # State-machine transition side-effects
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _apply_transition(
+        self,
         old_phase: DAggerPhase,
         new_phase: DAggerPhase,
         engine,
         interpolator,
         ctx: RolloutContext,
         prev_action: dict | None,
+        *,
+        defer_autonomous_resume: bool = False,
     ) -> None:
         """Execute side-effects for a validated phase transition, including smooth handovers.
 
@@ -642,12 +676,8 @@ class DAggerStrategy(RolloutStrategy):
             Slide the follower to the teleop's current pose so the robot meets
             the operator's hand rather than jumping to it on the first frame.
 
-        CORRECTING -> PAUSED (actuated teleop):
-            Re-enable torque to hold position after correction.
-            This will be potentially useful if cancelling the correction recording
-
-        PAUSED -> AUTONOMOUS:
-            Reset and resume the inference engine.
+        CORRECTING -> AUTONOMOUS:
+            Return the leader to its startup pose, then reset and resume inference.
         """
         teleop = ctx.hardware.teleop
         robot = ctx.hardware.robot_wrapper
@@ -656,18 +686,65 @@ class DAggerStrategy(RolloutStrategy):
         if old_phase == DAggerPhase.AUTONOMOUS and new_phase == DAggerPhase.PAUSED:
             logger.info("Pausing engine - robot holds position")
             engine.pause()
+            measured = robot.get_observation()
+            self._pause_hold_action = {k: float(v) for k, v in measured.items() if k.endswith(".pos")}
+            logger.info("Captured measured follower hold pose (%d joints)", len(self._pause_hold_action))
 
-            if teleop_supports_feedback(teleop) and prev_action is not None:
-                # TODO(Maxime): prev_action is in robot action key space (output of robot_action_processor).
+            if (
+                teleop_supports_feedback(teleop)
+                and not self.config.relative_clutch_handover
+                and self.config.smooth_leader_to_follower_handover
+            ):
+                # The measured hold pose is in robot action key space.
                 # send_feedback expects teleop feedback key space. For homogeneous setups (e.g. SO-101
                 # leader + SO-101 follower) the keys are identical so this works. If the processor pipeline
                 # does non-trivial key renaming (e.g. a rename_map on action keys), the interpolation in
                 # teleop_smooth_move_to silently no-ops and the arm doesn't move.
-                logger.info("Smooth handover: moving leader arm to follower position")
-                teleop_smooth_move_to(teleop, prev_action)
+                # Use the measured follower position rather than prev_action: policy actions can be ahead
+                # of the physical arm, especially when a follower-side relative target limiter is enabled.
+                logger.info("Smooth handover: moving leader arm to measured follower position")
+                teleop_smooth_move_to(teleop, self._pause_hold_action)
+            elif teleop_supports_feedback(teleop) and not self.config.relative_clutch_handover:
+                logger.info(
+                    "Manual handover: leader remains torque-free; align it to the follower, then request correction"
+                )
 
         elif old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
             logger.info("Entering correction mode - human teleop control")
+            if self.config.relative_clutch_handover:
+                if self._pause_hold_action is None:
+                    measured = robot.get_observation()
+                    self._pause_hold_action = {
+                        k: float(v) for k, v in measured.items() if k.endswith(".pos")
+                    }
+                self._clutch_leader_origin = teleop.get_action()
+                self._clutch_follower_origin = dict(self._pause_hold_action)
+                logger.info("Relative clutch engaged at current leader/follower poses")
+            elif teleop_supports_feedback(teleop) and not self.config.smooth_leader_to_follower_handover:
+                leader_pose = teleop.get_action()
+                differences = {
+                    key: abs(float(leader_pose[key]) - follower_value)
+                    for key, follower_value in (self._pause_hold_action or {}).items()
+                    if key in leader_pose
+                }
+                too_far = {
+                    key: delta
+                    for key, delta in differences.items()
+                    if delta > self.config.manual_handover_max_delta
+                }
+                if too_far:
+                    self._events.phase = DAggerPhase.PAUSED
+                    details = ", ".join(f"{key}={delta:.1f}" for key, delta in sorted(too_far.items()))
+                    logger.warning(
+                        "Correction rejected: manually align leader to follower within %.1f per joint (%s)",
+                        self.config.manual_handover_max_delta,
+                        details,
+                    )
+                    return
+                logger.info(
+                    "Manual handover alignment accepted (maximum joint difference %.1f)",
+                    max(differences.values(), default=0.0),
+                )
             if not teleop_supports_feedback(teleop) and prev_action is not None:
                 logger.info("Smooth handover: sliding follower to teleop position")
                 obs = robot.get_observation()
@@ -677,22 +754,45 @@ class DAggerStrategy(RolloutStrategy):
                 follower_smooth_move_to(robot, prev_action, target)
 
             # unlock the teleop for human control
-            if teleop_supports_feedback(teleop):
+            if (
+                teleop_supports_feedback(teleop)
+                and self.config.smooth_leader_to_follower_handover
+                and not self.config.relative_clutch_handover
+            ):
                 teleop.disable_torque()
 
         elif old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-            if teleop_supports_feedback(teleop):
+            if (
+                teleop_supports_feedback(teleop)
+                and not self.config.relative_clutch_handover
+                and self.config.smooth_leader_to_follower_handover
+            ):
                 teleop.enable_torque()
+            self._clutch_leader_origin = None
+            self._clutch_follower_origin = None
+            measured = robot.get_observation()
+            self._pause_hold_action = {k: float(v) for k, v in measured.items() if k.endswith(".pos")}
 
         elif new_phase == DAggerPhase.AUTONOMOUS:
-            logger.info("Resuming autonomous mode - resetting engine and interpolator")
+            logger.info("Preparing to resume autonomous mode")
             interpolator.reset()
             engine.reset()
-            engine.resume()
 
-            # release teleop before resuming the policy
-            if teleop_supports_feedback(teleop):
+            # Park and release the leader before the policy starts moving the
+            # follower again, so the operator's workspace is reset each cycle.
+            if teleop_supports_feedback(teleop) and self.config.smooth_leader_to_follower_handover:
+                if self._leader_start_pose is not None:
+                    logger.info("Returning leader to startup pose before resuming autonomous mode")
+                    teleop_smooth_move_to(teleop, self._leader_start_pose)
                 teleop.disable_torque()
+            if defer_autonomous_resume:
+                logger.info("Leader parked; autonomous resume deferred until correction is saved")
+            else:
+                engine.resume()
+                logger.info("Autonomous mode resumed")
+            self._clutch_leader_origin = None
+            self._clutch_follower_origin = None
+            self._pause_hold_action = None
 
     # ------------------------------------------------------------------
     # Background push (shared by both modes)

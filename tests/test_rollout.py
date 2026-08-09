@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import dataclasses
-from unittest.mock import MagicMock
+import threading
+import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -85,6 +87,202 @@ def test_dagger_config_defaults():
     assert cfg.num_episodes is None
     assert cfg.record_autonomous is False
     assert cfg.input_device == "keyboard"
+    assert cfg.relative_clutch_handover is False
+    assert cfg.smooth_leader_to_follower_handover is True
+    assert cfg.manual_handover_max_delta == 10.0
+
+
+def test_dagger_config_rejects_nonpositive_manual_handover_delta():
+    from lerobot.rollout import DAggerStrategyConfig
+
+    with pytest.raises(ValueError, match="manual_handover_max_delta must be greater than zero"):
+        DAggerStrategyConfig(manual_handover_max_delta=0)
+
+
+def test_dagger_relative_clutch_maps_leader_deltas_into_follower_space():
+    from lerobot.rollout import DAggerStrategy, DAggerStrategyConfig
+
+    strategy = DAggerStrategy(DAggerStrategyConfig(relative_clutch_handover=True))
+    strategy._clutch_leader_origin = {"elbow_flex.pos": -30.0, "gripper.pos": 20.0}
+    strategy._clutch_follower_origin = {"elbow_flex.pos": -40.0, "gripper.pos": 35.0}
+
+    mapped = strategy._apply_relative_clutch({"elbow_flex.pos": -35.0, "gripper.pos": 22.0})
+
+    assert mapped == {"elbow_flex.pos": -45.0, "gripper.pos": 37.0}
+
+
+def test_dagger_absolute_handover_uses_measured_follower_pose():
+    from lerobot.rollout import DAggerStrategy, DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+
+    strategy = DAggerStrategy(DAggerStrategyConfig())
+    ctx = MagicMock()
+    teleop = ctx.hardware.teleop
+    teleop.feedback_features = {"elbow_flex.pos": float}
+    robot = ctx.hardware.robot_wrapper
+    robot.get_observation.return_value = {
+        "elbow_flex.pos": -41.0,
+        "front": object(),
+    }
+
+    with patch("lerobot.rollout.strategies.dagger.teleop_smooth_move_to") as smooth_move:
+        strategy._apply_transition(
+            DAggerPhase.AUTONOMOUS,
+            DAggerPhase.PAUSED,
+            MagicMock(),
+            MagicMock(),
+            ctx,
+            {"elbow_flex.pos": -150.0},
+        )
+
+    smooth_move.assert_called_once_with(teleop, {"elbow_flex.pos": -41.0})
+
+
+def test_dagger_manual_handover_rejects_misaligned_leader_without_torque_write():
+    from lerobot.rollout import DAggerStrategy, DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(
+            smooth_leader_to_follower_handover=False,
+            manual_handover_max_delta=10.0,
+        )
+    )
+    strategy._events.phase = DAggerPhase.CORRECTING
+    strategy._pause_hold_action = {"elbow_flex.pos": -40.0}
+    ctx = MagicMock()
+    teleop = ctx.hardware.teleop
+    teleop.feedback_features = {"elbow_flex.pos": float}
+    teleop.get_action.return_value = {"elbow_flex.pos": -65.0}
+
+    strategy._apply_transition(
+        DAggerPhase.PAUSED,
+        DAggerPhase.CORRECTING,
+        MagicMock(),
+        MagicMock(),
+        ctx,
+        None,
+    )
+
+    assert strategy._events.phase == DAggerPhase.PAUSED
+    teleop.enable_torque.assert_not_called()
+    teleop.disable_torque.assert_not_called()
+
+
+def test_dagger_manual_handover_accepts_aligned_leader_without_torque_write():
+    from lerobot.rollout import DAggerStrategy, DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(
+            smooth_leader_to_follower_handover=False,
+            manual_handover_max_delta=10.0,
+        )
+    )
+    strategy._events.phase = DAggerPhase.CORRECTING
+    strategy._pause_hold_action = {"elbow_flex.pos": -40.0}
+    ctx = MagicMock()
+    teleop = ctx.hardware.teleop
+    teleop.feedback_features = {"elbow_flex.pos": float}
+    teleop.get_action.return_value = {"elbow_flex.pos": -43.0}
+
+    strategy._apply_transition(
+        DAggerPhase.PAUSED,
+        DAggerPhase.CORRECTING,
+        MagicMock(),
+        MagicMock(),
+        ctx,
+        None,
+    )
+
+    assert strategy._events.phase == DAggerPhase.CORRECTING
+    teleop.enable_torque.assert_not_called()
+    teleop.disable_torque.assert_not_called()
+
+
+def test_dagger_returns_leader_to_startup_pose_before_resuming_policy():
+    from lerobot.rollout import DAggerStrategy, DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+
+    strategy = DAggerStrategy(DAggerStrategyConfig())
+    strategy._leader_start_pose = {"elbow_flex.pos": -25.0}
+    ctx = MagicMock()
+    teleop = ctx.hardware.teleop
+    teleop.feedback_features = {"elbow_flex.pos": float}
+    engine = MagicMock()
+
+    with patch("lerobot.rollout.strategies.dagger.teleop_smooth_move_to") as smooth_move:
+        strategy._apply_transition(
+            DAggerPhase.PAUSED,
+            DAggerPhase.AUTONOMOUS,
+            engine,
+            MagicMock(),
+            ctx,
+            None,
+        )
+
+    smooth_move.assert_called_once_with(teleop, {"elbow_flex.pos": -25.0})
+    teleop.disable_torque.assert_called_once_with()
+    engine.resume.assert_called_once_with()
+
+
+def test_dagger_can_park_leader_while_deferring_policy_resume():
+    from lerobot.rollout import DAggerStrategy, DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+
+    strategy = DAggerStrategy(DAggerStrategyConfig())
+    strategy._leader_start_pose = {"elbow_flex.pos": -25.0}
+    ctx = MagicMock()
+    teleop = ctx.hardware.teleop
+    teleop.feedback_features = {"elbow_flex.pos": float}
+    engine = MagicMock()
+
+    with patch("lerobot.rollout.strategies.dagger.teleop_smooth_move_to") as smooth_move:
+        strategy._apply_transition(
+            DAggerPhase.CORRECTING,
+            DAggerPhase.AUTONOMOUS,
+            engine,
+            MagicMock(),
+            ctx,
+            None,
+            defer_autonomous_resume=True,
+        )
+
+    smooth_move.assert_called_once_with(teleop, {"elbow_flex.pos": -25.0})
+    teleop.disable_torque.assert_called_once_with()
+    engine.resume.assert_not_called()
+
+
+def test_so_leader_torque_enable_retries_each_motor():
+    from lerobot.teleoperators.so_leader.so_leader import TORQUE_COMM_RETRIES, SOLeader
+
+    leader = object.__new__(SOLeader)
+    leader.bus = MagicMock()
+    leader.bus.motors = {"shoulder_pan": object(), "gripper": object()}
+
+    leader.enable_torque()
+
+    assert leader.bus.enable_torque.call_args_list == [
+        (("shoulder_pan",), {"num_retry": TORQUE_COMM_RETRIES}),
+        (("gripper",), {"num_retry": TORQUE_COMM_RETRIES}),
+    ]
+
+
+def test_so_leader_torque_enable_rolls_back_partial_success():
+    from lerobot.teleoperators.so_leader.so_leader import TORQUE_COMM_RETRIES, SOLeader
+
+    leader = object.__new__(SOLeader)
+    leader.bus = MagicMock()
+    leader.bus.motors = {"shoulder_pan": object(), "elbow_flex": object(), "gripper": object()}
+    leader.bus.enable_torque.side_effect = [None, None, ConnectionError("no status packet")]
+
+    with pytest.raises(ConnectionError, match="no status packet"):
+        leader.enable_torque()
+
+    assert leader.bus.disable_torque.call_args_list == [
+        (("elbow_flex",), {"num_retry": TORQUE_COMM_RETRIES}),
+        (("shoulder_pan",), {"num_retry": TORQUE_COMM_RETRIES}),
+    ]
 
 
 def test_inference_config_types():
@@ -302,19 +500,14 @@ def test_dagger_full_transition_cycle():
     assert (old, new) == (DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED)
 
     # PAUSED -> CORRECTING
-    events.request_transition("correction")
+    events.request_transition("pause_resume")
     old, new = events.consume_transition()
     assert (old, new) == (DAggerPhase.PAUSED, DAggerPhase.CORRECTING)
 
-    # CORRECTING -> PAUSED
-    events.request_transition("correction")
-    old, new = events.consume_transition()
-    assert (old, new) == (DAggerPhase.CORRECTING, DAggerPhase.PAUSED)
-
-    # PAUSED -> AUTONOMOUS
+    # CORRECTING -> AUTONOMOUS
     events.request_transition("pause_resume")
     old, new = events.consume_transition()
-    assert (old, new) == (DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS)
+    assert (old, new) == (DAggerPhase.CORRECTING, DAggerPhase.AUTONOMOUS)
 
 
 def test_dagger_invalid_transition_ignored():
@@ -324,6 +517,25 @@ def test_dagger_invalid_transition_ignored():
     events.request_transition("correction")  # Not valid from AUTONOMOUS
     assert events.consume_transition() is None
     assert events.phase == DAggerPhase.AUTONOMOUS
+
+
+def test_rerun_shutdown_does_not_block_process_exit():
+    import rerun as rr
+
+    from lerobot.utils import rerun_visualization
+
+    release = threading.Event()
+
+    with (
+        patch.object(rr, "rerun_shutdown", side_effect=lambda: release.wait(timeout=1.0)),
+        patch.object(rerun_visualization, "RERUN_SHUTDOWN_TIMEOUT_S", 0.01),
+    ):
+        start = time.perf_counter()
+        rerun_visualization.shutdown_rerun()
+        elapsed = time.perf_counter() - start
+        release.set()
+
+    assert elapsed < 0.2
 
 
 def test_dagger_events_reset():

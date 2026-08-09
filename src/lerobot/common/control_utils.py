@@ -18,7 +18,7 @@ from __future__ import annotations
 # Utilities
 ########################################################################################
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from copy import copy
 from typing import TYPE_CHECKING, Any
 
@@ -197,17 +197,25 @@ def teleop_smooth_move_to(teleop, target_pos: dict, duration_s: float = 2.0, fps
     TODO(Maxime): This blocks up to ``duration_s`` seconds; during this time the
     follower robot does not receive new actions, which could be an issue on LeKiwi.
     """
-    teleop.enable_torque()
     current = teleop.get_action()
-    steps = max(int(duration_s * fps), 1)
+    try:
+        teleop.enable_torque()
+        steps = max(int(duration_s * fps), 1)
 
-    for step in range(steps + 1):
-        t = step / steps
-        interp = {
-            k: current[k] * (1 - t) + target_pos[k] * t if k in target_pos else current[k] for k in current
-        }
-        teleop.send_feedback(interp)
-        time.sleep(1 / fps)
+        for step in range(steps + 1):
+            t = step / steps
+            interp = {
+                k: current[k] * (1 - t) + target_pos[k] * t if k in target_pos else current[k]
+                for k in current
+            }
+            teleop.send_feedback(interp)
+            time.sleep(1 / fps)
+    except Exception:
+        # A multi-servo teleoperator can fail after enabling only a subset of
+        # joints. Best-effort rollback prevents those joints staying actuated.
+        with suppress(Exception):
+            teleop.disable_torque()
+        raise
 
 
 def follower_smooth_move_to(
