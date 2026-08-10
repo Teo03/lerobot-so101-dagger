@@ -527,6 +527,7 @@ def test_rerun_shutdown_does_not_block_process_exit():
     release = threading.Event()
 
     with (
+        patch.object(rr, "unregister_shutdown") as unregister_shutdown,
         patch.object(rr, "rerun_shutdown", side_effect=lambda: release.wait(timeout=1.0)),
         patch.object(rerun_visualization, "RERUN_SHUTDOWN_TIMEOUT_S", 0.01),
     ):
@@ -535,7 +536,25 @@ def test_rerun_shutdown_does_not_block_process_exit():
         elapsed = time.perf_counter() - start
         release.set()
 
+    unregister_shutdown.assert_called_once_with()
     assert elapsed < 0.2
+
+
+def test_dagger_escape_requests_global_shutdown():
+    from lerobot.rollout import DAggerKeyboardConfig
+    from lerobot.rollout.strategies import DAggerEvents
+    from lerobot.rollout.strategies.dagger import _init_dagger_keyboard
+
+    events = DAggerEvents()
+    shutdown_event = threading.Event()
+
+    with patch("lerobot.rollout.strategies.dagger.create_key_listener") as create_listener:
+        _init_dagger_keyboard(events, DAggerKeyboardConfig(), shutdown_event)
+        dispatch = create_listener.call_args.args[0]
+        dispatch("esc")
+
+    assert events.stop_recording.is_set()
+    assert shutdown_event.is_set()
 
 
 def test_dagger_events_reset():

@@ -71,10 +71,20 @@ def init_rerun(
 
 
 def shutdown_rerun() -> None:
-    """Shut down Rerun without allowing a backpressured channel to hang exit."""
+    """Shut down Rerun without allowing a backpressured channel to hang exit.
+
+    Rerun registers its own ``atexit`` shutdown hook.  If the bounded shutdown
+    below times out, leaving that hook registered causes Python to call the same
+    blocking native shutdown again during interpreter exit.  Unregister it first
+    so this function is the only shutdown attempt made by the rollout process.
+    """
 
     require_package("rerun-sdk", extra="viz", import_name="rerun")
     import rerun as rr
+
+    unregister_shutdown = getattr(rr, "unregister_shutdown", None)
+    if unregister_shutdown is not None:
+        unregister_shutdown()
 
     error: list[Exception] = []
 

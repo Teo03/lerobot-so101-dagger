@@ -161,7 +161,11 @@ class DAggerEvents:
 # ---------------------------------------------------------------------------
 
 
-def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
+def _init_dagger_keyboard(
+    events: DAggerEvents,
+    cfg: DAggerKeyboardConfig,
+    shutdown_event: Event,
+):
     """Initialise a keyboard listener for DAgger's single phase-advance control.
 
     Backend selection (pynput on X11 / trusted-macOS / Windows, a terminal reader on
@@ -173,6 +177,7 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
         if name == "esc":
             logger.info("Stop recording...")
             events.stop_recording.set()
+            shutdown_event.set()
             return
         if name == cfg.pause_resume:
             events.request_transition("pause_resume")
@@ -270,7 +275,11 @@ class DAggerStrategy(RolloutStrategy):
         )
 
         if self.config.input_device == "keyboard":
-            self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
+            self._listener = _init_dagger_keyboard(
+                self._events,
+                self.config.keyboard,
+                ctx.runtime.shutdown_event,
+            )
         else:
             self._pedal_thread = _init_dagger_pedal(self._events, self.config.pedal)
 
